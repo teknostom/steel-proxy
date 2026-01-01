@@ -1,0 +1,45 @@
+[package]
+name = "steel-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Steel crates (relative paths)
+steel-protocol = { path = "../SteelMC/steel-protocol" }
+steel-utils = { path = "../SteelMC/steel-utils" }
+steel-crypto = { path = "../SteelMC/steel-crypto" }
+steel-registry = { path = "../SteelMC/steel-registry" }
+
+# Async runtime
+tokio = { version = "1.48", features = ["full"] }
+tokio-util = "0.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Kubernetes
+kube = { version = "0.98", features = ["runtime", "client", "derive"] }
+k8s-openapi = { version = "0.24", features = ["v1_31"] }
+
+# Utilities (versions match SteelMC workspace where applicable)
+log = "0.4"
+env_logger = "0.11"
+crossbeam = "0.8"
+parking_lot = { version = "0.12", features = ["nightly"] }
+uuid = { version = "1.19", features = ["v4"] }
+thiserror = "2.0"
+anyhow = "1.0"
+rand = "0.10.0-rc.5"
+rsa = { version = "0.10.0-rc.10", features = ["sha2"] }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = true

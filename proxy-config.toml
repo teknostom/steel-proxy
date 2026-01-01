@@ -1,0 +1,29 @@
+# Steel Proxy Configuration
+
+# Address to bind the proxy to
+bind_address = "0.0.0.0"
+
+# Port to listen on
+bind_port = 25566
+
+# Public address that clients should connect to (for Transfer packets)
+# Use "localhost" for local testing, or your server's public IP/domain for production
+public_address = "localhost"
+
+# Enable online mode (Mojang authentication)
+# Currently only offline mode is supported (online mode coming soon)
+online_mode = false
+
+# Default server for new connections
+default_server = "steel"
+
+# Backend servers
+[backends.vanilla]
+address = "127.0.0.1"
+port = 25565
+description = "Vanilla Server"
+
+[backends.steel]
+address = "127.0.0.1"
+port = 25567
+description = "Steel Server"
