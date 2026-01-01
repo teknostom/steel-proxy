@@ -19,6 +19,12 @@ use steel_utils::text::TextComponent;
 
 use super::{BroadcastReceiver, ProxyServer};
 
+/// Result of handling a packet - signals whether to continue or terminate
+enum Action {
+    Continue,
+    Disconnect,
+}
+
 pub struct PacketForwarder {
     client_id: u64,
     player_uuid: uuid::Uuid,
@@ -88,9 +94,13 @@ impl PacketForwarder {
                 result = self.client_decoder.get_raw_packet() => {
                     match result {
                         Ok(packet) => {
-                            if let Err(e) = self.handle_client_packet(packet).await {
-                                error!("[Client {}] Error handling client packet: {}", self.client_id, e);
-                                return Err(e);
+                            match self.handle_client_packet(packet).await {
+                                Ok(Action::Continue) => {}
+                                Ok(Action::Disconnect) => return Ok(()),
+                                Err(e) => {
+                                    error!("[Client {}] Error handling client packet: {}", self.client_id, e);
+                                    return Err(e);
+                                }
                             }
                         }
                         Err(_) => {
@@ -128,7 +138,7 @@ impl PacketForwarder {
         }
     }
 
-    async fn handle_client_packet(&mut self, packet: RawPacket) -> Result<()> {
+    async fn handle_client_packet(&mut self, packet: RawPacket) -> Result<Action> {
         // Check for chat command in Play state (both signed and unsigned)
         if self.current_protocol == ConnectionProtocol::Play
             && (packet.id == packets::play::S_CHAT_COMMAND || packet.id == packets::play::S_CHAT_COMMAND_SIGNED)
@@ -141,17 +151,20 @@ impl PacketForwarder {
                 // Check if it's a server command
                 if command == "server" {
                     // No argument - list all servers
-                    return self.list_servers().await;
+                    self.list_servers().await?;
+                    return Ok(Action::Continue);
                 } else if let Some(server_name) = command.strip_prefix("server ") {
                     let server_name = server_name.trim();
                     info!("[Client {}] Switching to server: {}", self.client_id, server_name);
                     return self.switch_server(server_name).await;
                 } else if let Some(pr_arg) = command.strip_prefix("start ") {
                     let pr_arg = pr_arg.trim();
-                    return self.handle_start_command(pr_arg).await;
+                    self.handle_start_command(pr_arg).await?;
+                    return Ok(Action::Continue);
                 } else if let Some(pr_arg) = command.strip_prefix("status ") {
                     let pr_arg = pr_arg.trim();
-                    return self.handle_status_command(pr_arg).await;
+                    self.handle_status_command(pr_arg).await?;
+                    return Ok(Action::Continue);
                 }
             }
         }
@@ -162,7 +175,8 @@ impl PacketForwarder {
         }
 
         // Forward packet to backend
-        self.forward_to_backend(packet).await
+        self.forward_to_backend(packet).await?;
+        Ok(Action::Continue)
     }
 
     async fn handle_backend_packet(&mut self, mut packet: RawPacket) -> Result<()> {
@@ -296,7 +310,7 @@ impl PacketForwarder {
         Ok(())
     }
 
-    async fn switch_server(&mut self, server_name: &str) -> Result<()> {
+    async fn switch_server(&mut self, server_name: &str) -> Result<Action> {
         // Check if server exists
         let server_exists = {
             let backends_arc = self.proxy_server.backends();
@@ -311,7 +325,7 @@ impl PacketForwarder {
             );
             self.send_system_message(&format!("Unknown server: {server_name}"))
                 .await?;
-            return Ok(());
+            return Ok(Action::Continue);
         }
 
         info!(
@@ -330,8 +344,8 @@ impl PacketForwarder {
         let encoded = EncodedPacket::from_bare(transfer, None, ConnectionProtocol::Play).await?;
         self.client_encoder.write_packet(&encoded).await?;
 
-        // Client will disconnect and reconnect to the new server
-        Ok(())
+        // Terminate connection - client will reconnect and be routed to new server
+        Ok(Action::Disconnect)
     }
 
     async fn handle_start_command(&mut self, pr_arg: &str) -> Result<()> {
