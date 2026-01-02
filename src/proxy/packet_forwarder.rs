@@ -12,7 +12,7 @@ use steel_protocol::packets::game::CSystemChat;
 use steel_utils::serial::ReadFrom;
 use steel_utils::codec::VarInt;
 
-use crate::packets::{build_commands_for_permission_level, CTransfer};
+use crate::packets::{build_commands, CTransfer};
 use steel_protocol::utils::{ConnectionProtocol, RawPacket};
 use steel_registry::packets;
 use steel_utils::text::TextComponent;
@@ -152,7 +152,14 @@ impl PacketForwarder {
                         Ok(packet) => {
                             match self.handle_client_packet(packet).await {
                                 Ok(Action::Continue) => {}
-                                Ok(Action::Disconnect) => break Ok(()),
+                                Ok(Action::Disconnect) => {
+                                    // Transfer packet sent - wait for client to disconnect
+                                    // Continue forwarding backend packets until client closes connection
+                                    break self.drain_until_client_disconnects(
+                                        &mut backend_rx,
+                                        &mut client_rx,
+                                    ).await;
+                                }
                                 Err(e) => {
                                     error!("[Client {}] Error handling client packet: {}", self.client_id, e);
                                     break Err(e);
@@ -187,6 +194,44 @@ impl PacketForwarder {
         client_reader.abort();
 
         result
+    }
+
+    /// After sending a Transfer packet, continue forwarding backend packets until the client disconnects.
+    /// This ensures the client receives any in-flight packets before processing the Transfer.
+    async fn drain_until_client_disconnects(
+        &mut self,
+        backend_rx: &mut tokio::sync::mpsc::Receiver<Result<RawPacket, String>>,
+        client_rx: &mut tokio::sync::mpsc::Receiver<Result<RawPacket, String>>,
+    ) -> Result<()> {
+        let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(2));
+        tokio::pin!(timeout);
+
+        loop {
+            select! {
+                // Continue forwarding backend packets
+                Some(result) = backend_rx.recv() => {
+                    if let Ok(packet) = result {
+                        // Best effort forward, ignore errors (client may have disconnected)
+                        let _ = self.forward_to_client(packet).await;
+                    }
+                }
+
+                // Wait for client to disconnect
+                Some(result) = client_rx.recv() => {
+                    if result.is_err() {
+                        info!("[Client {}] Client disconnected after transfer", self.client_id);
+                        return Ok(());
+                    }
+                    // Ignore any packets from client, they're switching servers
+                }
+
+                // Timeout - force disconnect
+                _ = &mut timeout => {
+                    info!("[Client {}] Transfer timeout, closing connection", self.client_id);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn handle_client_packet(&mut self, packet: RawPacket) -> Result<Action> {
@@ -265,21 +310,18 @@ impl PacketForwarder {
                     // Check if this is for our player and is a permission level update
                     if self.entity_id == Some(entity_id) && (24..=28).contains(&status) {
                         self.permission_level = status - 24;
-                        info!(
+                        debug!(
                             "[Client {}] Permission level updated to {}",
                             self.client_id, self.permission_level
                         );
-
-                        // Send updated commands packet with new permission level
-                        self.send_commands_packet().await?;
                     }
                 }
             }
-            // Commands packet (16) - replace with our own filtered command tree
+            // Commands packet (16) - replace with our own command tree
             else if packet.id == packets::play::C_COMMANDS {
                 debug!(
-                    "[Client {}] Intercepting commands packet, sending filtered tree (permission_level={})",
-                    self.client_id, self.permission_level
+                    "[Client {}] Intercepting commands packet, sending proxy command tree",
+                    self.client_id
                 );
                 return self.send_commands_packet().await;
             }
@@ -290,7 +332,7 @@ impl PacketForwarder {
     }
 
     async fn send_commands_packet(&mut self) -> Result<()> {
-        let commands = build_commands_for_permission_level(self.permission_level);
+        let commands = build_commands();
         let encoded =
             EncodedPacket::from_bare(commands, None, ConnectionProtocol::Play).await?;
         self.client_encoder.write_packet(&encoded).await?;
@@ -414,18 +456,11 @@ impl PacketForwarder {
         let encoded = EncodedPacket::from_bare(transfer, None, ConnectionProtocol::Play).await?;
         self.client_encoder.write_packet(&encoded).await?;
 
-        // Terminate connection - client will reconnect and be routed to new server
+        // Signal to drain backend packets until client disconnects
         Ok(Action::Disconnect)
     }
 
     async fn handle_start_command(&mut self, pr_arg: &str) -> Result<()> {
-        // Check permission level (require OP level 2+)
-        if self.permission_level < 2 {
-            self.send_system_message("§cYou need OP permissions to start PR instances")
-                .await?;
-            return Ok(());
-        }
-
         // Parse PR number
         let pr_number: u32 = match pr_arg.parse() {
             Ok(n) => n,
@@ -456,13 +491,6 @@ impl PacketForwarder {
     }
 
     async fn handle_status_command(&mut self, pr_arg: &str) -> Result<()> {
-        // Check permission level (require OP level 2+)
-        if self.permission_level < 2 {
-            self.send_system_message("§cYou need OP permissions to check PR status")
-                .await?;
-            return Ok(());
-        }
-
         // Parse PR number
         let pr_number: u32 = match pr_arg.parse() {
             Ok(n) => n,

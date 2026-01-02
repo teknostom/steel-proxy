@@ -1,5 +1,6 @@
 use anyhow::Result;
 use log::{error, info};
+use sqlx::sqlite::SqlitePool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ mod packet_forwarder;
 use client_handler::ClientHandler;
 
 use crate::config::{BackendServer, ProxyConfig};
+use crate::github::GitHubClient;
 use crate::jenkins::JenkinsClient;
 use crate::k8s::K8sManager;
 
@@ -76,6 +78,10 @@ pub struct ProxyServer {
     k8s_manager: Option<Arc<K8sManager>>,
     /// Jenkins client for triggering builds (None if jenkins not configured)
     jenkins_client: Option<Arc<JenkinsClient>>,
+    /// GitHub client for fetching PR info (None if github not configured)
+    github_client: Option<Arc<GitHubClient>>,
+    /// Database connection pool
+    db_pool: SqlitePool,
 }
 
 impl ProxyServer {
@@ -83,6 +89,8 @@ impl ProxyServer {
         config: ProxyConfig,
         k8s_manager: Option<Arc<K8sManager>>,
         jenkins_client: Option<Arc<JenkinsClient>>,
+        github_client: Option<Arc<GitHubClient>>,
+        db_pool: SqlitePool,
     ) -> Self {
         let backends = BackendRegistry::new(config.backends.clone());
         let (broadcast_tx, _) = broadcast::channel(16);
@@ -95,7 +103,19 @@ impl ProxyServer {
             broadcast_tx,
             k8s_manager,
             jenkins_client,
+            github_client,
+            db_pool,
         }
+    }
+
+    /// Get a reference to the database pool
+    pub fn db_pool(&self) -> &SqlitePool {
+        &self.db_pool
+    }
+
+    /// Get a reference to the GitHub client
+    pub fn github_client(&self) -> Option<&Arc<GitHubClient>> {
+        self.github_client.as_ref()
     }
 
     /// Get a reference to the K8s manager
@@ -150,6 +170,10 @@ impl ProxyServer {
     /// Start a PR instance build
     /// Returns Ok(()) if build was triggered, Err if something went wrong
     pub async fn start_pr(&self, pr_number: u32) -> Result<()> {
+        // Check if GitHub is configured (needed for commit lookup)
+        let github = self.github_client.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GitHub not configured"))?;
+
         // Check if Jenkins is configured
         let jenkins = self.jenkins_client.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Jenkins not configured"))?;
@@ -171,16 +195,39 @@ impl ProxyServer {
         }
         drop(backends);
 
-        // Trigger Jenkins build
-        info!("Starting build for PR #{}", pr_number);
-        self.broadcast(&format!("§e[Proxy] Starting build for PR #{}...", pr_number));
+        // Fetch current commit hash from GitHub
+        self.broadcast(&format!("§7[Proxy] Fetching PR #{} info from GitHub...", pr_number));
+        let (commit_hash, commit_hash_short) = github.get_pr_head_commit(pr_number).await?;
+        info!("PR #{} head commit: {}", pr_number, commit_hash_short);
 
-        let queue_url = jenkins.trigger_build(pr_number).await?;
+        // Check if we already have an image with this commit (can skip build)
+        let existing_build = crate::db::PrBuild::exists_with_commit(
+            &self.db_pool,
+            pr_number,
+            &commit_hash_short,
+        ).await?;
 
-        // Create instance in Building state
-        k8s.create_building_instance(pr_number, queue_url);
+        if existing_build {
+            // Image already exists, skip directly to deploy
+            info!("PR #{} image already exists for commit {}, skipping build", pr_number, commit_hash_short);
+            self.broadcast(&format!(
+                "§a[Proxy] PR #{} already built for commit {}. Deploying...",
+                pr_number, commit_hash_short
+            ));
 
-        self.broadcast(&format!("§a[Proxy] PR #{} build queued. You will be notified when it's ready.", pr_number));
+            k8s.create_deploying_instance(pr_number, commit_hash, commit_hash_short);
+        } else {
+            // Need to build new image
+            info!("Starting build for PR #{} commit {}", pr_number, commit_hash_short);
+            self.broadcast(&format!("§e[Proxy] Building PR #{} (commit {})...", pr_number, commit_hash_short));
+
+            let queue_url = jenkins.trigger_build(pr_number, &commit_hash_short).await?;
+
+            // Create instance in Building state
+            k8s.create_building_instance(pr_number, commit_hash, commit_hash_short, queue_url);
+
+            self.broadcast(&format!("§a[Proxy] PR #{} build queued. You will be notified when it's ready.", pr_number));
+        }
 
         Ok(())
     }

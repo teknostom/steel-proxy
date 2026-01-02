@@ -23,6 +23,10 @@ pub struct ProxyConfig {
     #[serde(default = "default_online_mode")]
     pub online_mode: bool,
 
+    /// Path to SQLite database file
+    #[serde(default = "default_database_path")]
+    pub database_path: String,
+
     /// Default server for new connections
     pub default_server: String,
 
@@ -34,6 +38,9 @@ pub struct ProxyConfig {
 
     /// Jenkins configuration (optional - enables PR builds)
     pub jenkins: Option<JenkinsConfig>,
+
+    /// GitHub configuration (optional - enables PR commit lookup)
+    pub github: Option<GitHubConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +112,18 @@ pub struct JenkinsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubConfig {
+    /// Repository owner (e.g., "octocat")
+    pub owner: String,
+
+    /// Repository name (e.g., "hello-world")
+    pub repo: String,
+
+    /// Personal access token (optional - for private repos or higher rate limits)
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendServer {
     /// Server address
     pub address: String,
@@ -114,6 +133,10 @@ pub struct BackendServer {
 
     /// Server description (optional)
     pub description: Option<String>,
+}
+
+fn default_database_path() -> String {
+    "steel-proxy.db".to_string()
 }
 
 fn default_bind_address() -> String {
@@ -200,10 +223,12 @@ impl ProxyConfig {
             bind_port: default_bind_port(),
             public_address: default_public_address(),
             online_mode: default_online_mode(),
+            database_path: default_database_path(),
             default_server: "lobby".to_string(),
             backends,
             kubernetes: None,
             jenkins: None,
+            github: None,
         };
 
         let toml = toml::to_string_pretty(&config)?;

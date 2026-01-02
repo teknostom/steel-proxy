@@ -24,6 +24,8 @@ pub async fn run_lifecycle_loop(
         let instances = k8s_manager.get_instances_snapshot();
 
         for (pr_number, instance) in instances {
+            let commit_hash_short = instance.commit_hash_short.clone();
+
             match &instance.state {
                 InstanceState::Building {
                     started_at,
@@ -31,6 +33,7 @@ pub async fn run_lifecycle_loop(
                 } => {
                     handle_building(
                         pr_number,
+                        &commit_hash_short,
                         started_at,
                         build_url.as_deref(),
                         &proxy_server,
@@ -58,6 +61,8 @@ pub async fn run_lifecycle_loop(
                 } => {
                     handle_starting(
                         pr_number,
+                        &instance.commit_hash,
+                        &commit_hash_short,
                         deployment_name,
                         address,
                         *port,
@@ -101,6 +106,7 @@ pub async fn run_lifecycle_loop(
 /// Handle a building instance - poll Jenkins for build status
 async fn handle_building(
     pr_number: u32,
+    commit_hash_short: &str,
     started_at: &Instant,
     queue_url: Option<&str>,
     proxy_server: &ProxyServer,
@@ -152,8 +158,8 @@ async fn handle_building(
                 pr_number
             ));
 
-            // Transition to Deploying state
-            let image_tag = format!("pr-{}", pr_number);
+            // Transition to Deploying state with commit-specific image tag
+            let image_tag = format!("pr-{}-{}", pr_number, commit_hash_short);
             k8s_manager.update_instance_state(
                 pr_number,
                 InstanceState::Deploying { image_tag },
@@ -188,12 +194,12 @@ async fn handle_building(
 /// Handle deploying state - create k8s deployment
 async fn handle_deploying(
     pr_number: u32,
-    _image_tag: &str,
+    image_tag: &str,
     proxy_server: &ProxyServer,
     k8s_manager: &K8sManager,
 ) {
-    // Create deployment
-    match k8s_manager.create_deployment(pr_number).await {
+    // Create deployment with the commit-specific image tag
+    match k8s_manager.create_deployment(pr_number, image_tag).await {
         Ok(deployment_name) => {
             info!("Created deployment {} for PR #{}", deployment_name, pr_number);
 
@@ -245,6 +251,8 @@ async fn handle_deploying(
 /// Handle starting state - wait for pod readiness
 async fn handle_starting(
     pr_number: u32,
+    commit_hash: &str,
+    commit_hash_short: &str,
     deployment_name: &str,
     address: &str,
     port: u16,
@@ -294,6 +302,20 @@ async fn handle_starting(
                     shutdown_at,
                 },
             );
+
+            // Persist to database so we can skip builds for this commit next time
+            let image_tag = format!("pr-{}-{}", pr_number, commit_hash_short);
+            if let Err(e) = crate::db::PrBuild::upsert(
+                k8s_manager.db_pool(),
+                pr_number,
+                commit_hash,
+                commit_hash_short,
+                &image_tag,
+                "Ready",
+                None,
+            ).await {
+                warn!("Failed to persist PR #{} build to database: {}", pr_number, e);
+            }
 
             proxy_server.broadcast(&format!(
                 "§a[Proxy] PR #{} is ready! Use §e/server pr-{}§a to connect.",

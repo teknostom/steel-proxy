@@ -1,15 +1,18 @@
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 mod config;
+mod db;
+mod github;
 mod jenkins;
 mod k8s;
 mod packets;
 mod proxy;
 
 use config::ProxyConfig;
+use github::GitHubClient;
 use jenkins::JenkinsClient;
 use k8s::K8sManager;
 use proxy::ProxyServer;
@@ -28,6 +31,16 @@ async fn main() -> Result<()> {
         config.backends.len()
     );
 
+    // Initialize database
+    let db_pool = db::init(&config.database_path).await?;
+    info!("Database initialized: {}", config.database_path);
+
+    // Create GitHub client if configured
+    let github_client = config.github.as_ref().map(|cfg| {
+        info!("GitHub integration enabled: {}/{}", cfg.owner, cfg.repo);
+        Arc::new(GitHubClient::new(cfg.clone()))
+    });
+
     // Create Jenkins client if configured
     let jenkins_client = config.jenkins.as_ref().map(|cfg| {
         info!("Jenkins integration enabled: {}", cfg.url);
@@ -37,7 +50,7 @@ async fn main() -> Result<()> {
     // Create K8s manager if configured
     let k8s_manager = config.kubernetes.as_ref().map(|cfg| {
         info!("Kubernetes integration enabled: namespace={}", cfg.namespace);
-        Arc::new(K8sManager::new(cfg.clone()))
+        Arc::new(K8sManager::new(cfg.clone(), db_pool.clone()))
     });
 
     // Create proxy server
@@ -45,10 +58,19 @@ async fn main() -> Result<()> {
         config.clone(),
         k8s_manager.clone(),
         jenkins_client.clone(),
+        github_client,
+        db_pool,
     ));
 
     // Spawn lifecycle loop if k8s and jenkins are configured
     if let (Some(k8s_manager), Some(jenkins_client)) = (k8s_manager, jenkins_client) {
+        // Recover any running instances from database
+        match k8s_manager.recover_from_db(&proxy).await {
+            Ok(0) => info!("No instances to recover from database"),
+            Ok(n) => info!("Recovered {} instances from database", n),
+            Err(e) => warn!("Failed to recover instances from database: {}", e),
+        }
+
         let proxy_for_lifecycle = proxy.clone();
         tokio::spawn(async move {
             info!("Starting PR instance lifecycle manager");

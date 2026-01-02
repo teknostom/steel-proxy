@@ -35,19 +35,22 @@ impl JenkinsClient {
 
     /// Trigger a build for a PR
     /// Returns the queue URL to poll for build status
-    pub async fn trigger_build(&self, pr_number: u32) -> Result<String> {
+    pub async fn trigger_build(&self, pr_number: u32, commit_hash_short: &str) -> Result<String> {
         let url = format!(
             "{}/job/{}/buildWithParameters",
             self.config.url, self.config.job_name
         );
 
-        info!("Triggering Jenkins build for PR #{}", pr_number);
+        info!("Triggering Jenkins build for PR #{} commit {}", pr_number, commit_hash_short);
 
         let response: reqwest::Response = self
             .http
             .post(&url)
             .basic_auth(&self.config.username, Some(&self.config.api_token))
-            .form(&[("PR_NUMBER", pr_number.to_string())])
+            .form(&[
+                ("PR_NUMBER", pr_number.to_string()),
+                ("COMMIT_HASH", commit_hash_short.to_string()),
+            ])
             .send()
             .await
             .context("Failed to trigger Jenkins build")?;
@@ -66,7 +69,7 @@ impl JenkinsClient {
             .map(|s: &str| s.to_string())
             .unwrap_or_else(|| format!("{}/queue/", self.config.url));
 
-        info!("Build queued for PR #{}: {}", pr_number, queue_url);
+        info!("Build queued for PR #{} commit {}: {}", pr_number, commit_hash_short, queue_url);
         Ok(queue_url)
     }
 

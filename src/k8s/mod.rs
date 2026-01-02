@@ -14,6 +14,7 @@ use kube::Client;
 use log::{info, warn};
 use parking_lot::Mutex;
 use serde_json::json;
+use sqlx::sqlite::SqlitePool;
 
 use crate::config::{BackendServer, KubernetesConfig};
 use crate::proxy::ProxyServer;
@@ -25,14 +26,118 @@ pub struct K8sManager {
     instances: Mutex<HashMap<u32, PrInstance>>,
     /// Kubernetes client (initialized lazily)
     kube_client: tokio::sync::OnceCell<Client>,
+    /// Database connection pool
+    db_pool: SqlitePool,
 }
 
 impl K8sManager {
-    pub fn new(config: KubernetesConfig) -> Self {
+    pub fn new(config: KubernetesConfig, db_pool: SqlitePool) -> Self {
         Self {
             config,
             instances: Mutex::new(HashMap::new()),
             kube_client: tokio::sync::OnceCell::new(),
+            db_pool,
+        }
+    }
+
+    /// Get a reference to the database pool
+    pub fn db_pool(&self) -> &SqlitePool {
+        &self.db_pool
+    }
+
+    /// Recover instances from database on startup
+    /// Returns the number of recovered instances
+    pub async fn recover_from_db(&self, proxy_server: &ProxyServer) -> anyhow::Result<usize> {
+        use crate::db::PrBuild;
+
+        // Load all Ready builds from database
+        let builds = PrBuild::get_active_builds(&self.db_pool).await?;
+        let mut recovered = 0;
+
+        for build in builds {
+            let pr_number = build.pr_number as u32;
+            let deployment_name = format!("steel-pr-{}", pr_number);
+
+            // Check if deployment still exists in K8s
+            match self.is_deployment_ready(&deployment_name).await {
+                Ok(true) => {
+                    // Deployment exists and is ready - recover it
+                    info!("Recovering PR #{} from database (deployment exists)", pr_number);
+
+                    // Get service info
+                    if let Ok(Some((address, port))) = self.get_service_info(pr_number).await {
+                        // Create instance in Ready state
+                        let instance = PrInstance::new_deploying(
+                            pr_number,
+                            build.commit_hash.clone(),
+                            build.commit_hash_short.clone(),
+                            build.image_tag.clone(),
+                        );
+
+                        // Override state to Ready
+                        let timeout_minutes = self.config.instance_timeout_minutes;
+                        let shutdown_at = std::time::Instant::now()
+                            + std::time::Duration::from_secs(timeout_minutes * 60);
+
+                        let mut instances = self.instances.lock();
+                        instances.insert(pr_number, PrInstance {
+                            pr_number,
+                            commit_hash: build.commit_hash,
+                            commit_hash_short: build.commit_hash_short,
+                            state: InstanceState::Ready {
+                                deployment_name: deployment_name.clone(),
+                                address: address.clone(),
+                                port,
+                                ready_at: std::time::Instant::now(),
+                                shutdown_at,
+                            },
+                        });
+                        drop(instances);
+
+                        // Register as backend
+                        self.register_backend(pr_number, address, port, proxy_server).await;
+                        recovered += 1;
+                    } else {
+                        warn!("PR #{} deployment exists but service not found, removing from DB", pr_number);
+                        let _ = PrBuild::delete(&self.db_pool, pr_number).await;
+                    }
+                }
+                Ok(false) => {
+                    // Deployment exists but not ready - could be starting
+                    info!("PR #{} deployment exists but not ready, will be handled by lifecycle", pr_number);
+                }
+                Err(_) => {
+                    // Deployment doesn't exist - clean up DB
+                    info!("PR #{} deployment not found in K8s, removing from database", pr_number);
+                    let _ = PrBuild::delete(&self.db_pool, pr_number).await;
+                }
+            }
+        }
+
+        Ok(recovered)
+    }
+
+    /// Get service info for a PR (address, port)
+    async fn get_service_info(&self, pr_number: u32) -> anyhow::Result<Option<(String, u16)>> {
+        let client = self.client().await?;
+        let services: Api<Service> = Api::namespaced(client.clone(), &self.config.namespace);
+
+        let name = format!("steel-pr-{}", pr_number);
+        match services.get(&name).await {
+            Ok(svc) => {
+                if let Some(spec) = svc.spec {
+                    if let Some(ports) = spec.ports {
+                        if let Some(port) = ports.first() {
+                            if let Some(node_port) = port.node_port {
+                                return Ok(Some((self.config.node_address.clone(), node_port as u16)));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -48,7 +153,8 @@ impl K8sManager {
     }
 
     /// Create a Kubernetes deployment for a PR instance (deletes existing if present)
-    pub async fn create_deployment(&self, pr_number: u32) -> Result<String> {
+    /// image_tag should be the tag only (e.g., "pr-42-abc1234"), not the full image path
+    pub async fn create_deployment(&self, pr_number: u32, image_tag: &str) -> Result<String> {
         let client = self.client().await?;
         let deployments: Api<Deployment> = Api::namespaced(client.clone(), &self.config.namespace);
 
@@ -69,8 +175,8 @@ impl K8sManager {
             }
         }
         let image = format!(
-            "{}/{}:pr-{}",
-            self.config.registry, self.config.image_name, pr_number
+            "{}/{}:{}",
+            self.config.registry, self.config.image_name, image_tag
         );
 
         let labels: BTreeMap<String, String> = [
@@ -253,32 +359,33 @@ impl K8sManager {
         self.instances.lock().contains_key(&pr_number)
     }
 
-    /// Create an instance in Building state with queue URL
-    pub fn create_building_instance(&self, pr_number: u32, queue_url: String) {
-        let instance = PrInstance::new_with_queue_url(pr_number, queue_url);
+    /// Create an instance in Building state with commit info and queue URL
+    pub fn create_building_instance(
+        &self,
+        pr_number: u32,
+        commit_hash: String,
+        commit_hash_short: String,
+        queue_url: String,
+    ) {
+        let instance = PrInstance::new_building(pr_number, commit_hash, commit_hash_short, queue_url);
         self.instances.lock().insert(pr_number, instance);
         info!("Created building instance for PR #{}", pr_number);
     }
 
-    /// Start building a PR instance
-    pub fn start_pr(&self, pr_number: u32) -> Result<(), String> {
-        let mut instances = self.instances.lock();
-
-        // Check if already exists
-        if let Some(instance) = instances.get(&pr_number) {
-            return Err(format!(
-                "PR #{} is already {}",
-                pr_number,
-                instance.state.status_text()
-            ));
-        }
-
-        // Create new instance in Building state
-        let instance = PrInstance::new(pr_number);
-        instances.insert(pr_number, instance);
-
-        info!("Started build for PR #{}", pr_number);
-        Ok(())
+    /// Create an instance in Deploying state (skipping build because image exists)
+    pub fn create_deploying_instance(
+        &self,
+        pr_number: u32,
+        commit_hash: String,
+        commit_hash_short: String,
+    ) {
+        let image_tag = format!(
+            "{}/{}:pr-{}-{}",
+            self.config.registry, self.config.image_name, pr_number, commit_hash_short
+        );
+        let instance = PrInstance::new_deploying(pr_number, commit_hash, commit_hash_short, image_tag);
+        self.instances.lock().insert(pr_number, instance);
+        info!("Created deploying instance for PR #{} (skipping build)", pr_number);
     }
 
     /// Get the current state of a PR instance

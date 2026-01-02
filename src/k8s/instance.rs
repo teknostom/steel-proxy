@@ -49,29 +49,37 @@ impl InstanceState {
 #[derive(Debug, Clone)]
 pub struct PrInstance {
     pub pr_number: u32,
+    pub commit_hash: String,
+    pub commit_hash_short: String,
     pub state: InstanceState,
 }
 
 impl PrInstance {
-    /// Create a new instance in Building state
-    pub fn new(pr_number: u32) -> Self {
+    /// Create a new instance in Building state with commit info
+    pub fn new_building(pr_number: u32, commit_hash: String, commit_hash_short: String, queue_url: String) -> Self {
         Self {
             pr_number,
-            state: InstanceState::Building {
-                started_at: Instant::now(),
-                build_url: None,
-            },
-        }
-    }
-
-    /// Create a new instance in Building state with a queue URL
-    pub fn new_with_queue_url(pr_number: u32, queue_url: String) -> Self {
-        Self {
-            pr_number,
+            commit_hash,
+            commit_hash_short,
             state: InstanceState::Building {
                 started_at: Instant::now(),
                 build_url: Some(queue_url),
             },
         }
+    }
+
+    /// Create a new instance in Deploying state (skipping build because image exists)
+    pub fn new_deploying(pr_number: u32, commit_hash: String, commit_hash_short: String, image_tag: String) -> Self {
+        Self {
+            pr_number,
+            commit_hash,
+            commit_hash_short,
+            state: InstanceState::Deploying { image_tag },
+        }
+    }
+
+    /// Get the image tag for this instance
+    pub fn image_tag(&self, registry: &str, image_name: &str) -> String {
+        format!("{}/{}:pr-{}-{}", registry, image_name, self.pr_number, self.commit_hash_short)
     }
 }
