@@ -379,10 +379,7 @@ impl K8sManager {
         commit_hash: String,
         commit_hash_short: String,
     ) {
-        let image_tag = format!(
-            "{}/{}:pr-{}-{}",
-            self.config.registry, self.config.image_name, pr_number, commit_hash_short
-        );
+        let image_tag = format!("pr-{}-{}", pr_number, commit_hash_short);
         let instance = PrInstance::new_deploying(pr_number, commit_hash, commit_hash_short, image_tag);
         self.instances.lock().insert(pr_number, instance);
         info!("Created deploying instance for PR #{} (skipping build)", pr_number);
