@@ -6,13 +6,13 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::select;
 
 use steel_protocol::packet_reader::TCPNetworkDecoder;
-use steel_protocol::packet_traits::{EncodedPacket, ServerPacket};
+use steel_protocol::packet_traits::EncodedPacket;
 use steel_protocol::packet_writer::TCPNetworkEncoder;
 use steel_protocol::packets::game::CSystemChat;
 use steel_utils::serial::ReadFrom;
 use steel_utils::codec::VarInt;
 
-use crate::packets::CTransfer;
+use crate::packets::{build_commands_for_permission_level, CTransfer};
 use steel_protocol::utils::{ConnectionProtocol, RawPacket};
 use steel_registry::packets;
 use steel_utils::text::TextComponent;
@@ -30,12 +30,12 @@ pub struct PacketForwarder {
     player_uuid: uuid::Uuid,
     proxy_server: std::sync::Arc<ProxyServer>,
 
-    // Client connection
-    client_decoder: TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+    // Client connection (Option so we can take() them for spawned tasks)
+    client_decoder: Option<TCPNetworkDecoder<BufReader<OwnedReadHalf>>>,
     client_encoder: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
 
-    // Backend connection
-    backend_decoder: TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+    // Backend connection (Option so we can take() them for spawned tasks)
+    backend_decoder: Option<TCPNetworkDecoder<BufReader<OwnedReadHalf>>>,
     backend_encoder: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
 
     // Broadcast receiver for system messages
@@ -69,9 +69,9 @@ impl PacketForwarder {
             client_id,
             player_uuid,
             proxy_server,
-            client_decoder,
+            client_decoder: Some(client_decoder),
             client_encoder,
-            backend_decoder,
+            backend_decoder: Some(backend_decoder),
             backend_encoder,
             broadcast_rx,
             current_backend,
@@ -88,40 +88,80 @@ impl PacketForwarder {
             self.client_id, self.current_backend
         );
 
-        loop {
+        // Use channels to communicate between reader tasks and the main handler
+        let (backend_tx, mut backend_rx) = tokio::sync::mpsc::channel::<Result<RawPacket, String>>(32);
+        let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<Result<RawPacket, String>>(32);
+
+        // Spawn backend reader task (separate task ensures reads aren't cancelled mid-packet)
+        let mut backend_decoder = self.backend_decoder.take().expect("backend_decoder already taken");
+        let backend_reader = tokio::spawn(async move {
+            loop {
+                match backend_decoder.get_raw_packet().await {
+                    Ok(packet) => {
+                        if backend_tx.send(Ok(packet)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = backend_tx.send(Err(e.to_string())).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Spawn client reader task (separate task ensures reads aren't cancelled mid-packet)
+        let mut client_decoder = self.client_decoder.take().expect("client_decoder already taken");
+        let client_reader = tokio::spawn(async move {
+            loop {
+                match client_decoder.get_raw_packet().await {
+                    Ok(packet) => {
+                        if client_tx.send(Ok(packet)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = client_tx.send(Err(e.to_string())).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        let result = loop {
             select! {
+                // Backend -> Client packets
+                Some(result) = backend_rx.recv() => {
+                    match result {
+                        Ok(packet) => {
+                            if let Err(e) = self.handle_backend_packet(packet).await {
+                                error!("[Client {}] Error handling backend packet: {}", self.client_id, e);
+                                break Err(e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[Client {}] Backend disconnected: {}", self.client_id, e);
+                            break Err(anyhow::anyhow!("Backend read failed: {}", e));
+                        }
+                    }
+                }
+
                 // Client -> Backend packets
-                result = self.client_decoder.get_raw_packet() => {
+                Some(result) = client_rx.recv() => {
                     match result {
                         Ok(packet) => {
                             match self.handle_client_packet(packet).await {
                                 Ok(Action::Continue) => {}
-                                Ok(Action::Disconnect) => return Ok(()),
+                                Ok(Action::Disconnect) => break Ok(()),
                                 Err(e) => {
                                     error!("[Client {}] Error handling client packet: {}", self.client_id, e);
-                                    return Err(e);
+                                    break Err(e);
                                 }
                             }
                         }
                         Err(_) => {
                             info!("[Client {}] Client disconnected", self.client_id);
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // Backend -> Client packets
-                result = self.backend_decoder.get_raw_packet() => {
-                    match result {
-                        Ok(packet) => {
-                            if let Err(e) = self.handle_backend_packet(packet).await {
-                                error!("[Client {}] Error handling backend packet: {}", self.client_id, e);
-                                return Err(e);
-                            }
-                        }
-                        Err(e) => {
-                            warn!("[Client {}] Backend disconnected: {}", self.client_id, e);
-                            return Err(e.into());
+                            break Ok(());
                         }
                     }
                 }
@@ -134,8 +174,19 @@ impl PacketForwarder {
                         }
                     }
                 }
+
+                else => {
+                    info!("[Client {}] All channels closed", self.client_id);
+                    break Ok(());
+                }
             }
-        }
+        };
+
+        // Abort reader tasks
+        backend_reader.abort();
+        client_reader.abort();
+
+        result
     }
 
     async fn handle_client_packet(&mut self, packet: RawPacket) -> Result<Action> {
@@ -179,7 +230,7 @@ impl PacketForwarder {
         Ok(Action::Continue)
     }
 
-    async fn handle_backend_packet(&mut self, mut packet: RawPacket) -> Result<()> {
+    async fn handle_backend_packet(&mut self, packet: RawPacket) -> Result<()> {
         // Track permission level and inject commands
         if self.current_protocol == ConnectionProtocol::Play {
             // Login packet (48) - contains entity ID
@@ -218,13 +269,32 @@ impl PacketForwarder {
                             "[Client {}] Permission level updated to {}",
                             self.client_id, self.permission_level
                         );
+
+                        // Send updated commands packet with new permission level
+                        self.send_commands_packet().await?;
                     }
                 }
+            }
+            // Commands packet (16) - replace with our own filtered command tree
+            else if packet.id == packets::play::C_COMMANDS {
+                debug!(
+                    "[Client {}] Intercepting commands packet, sending filtered tree (permission_level={})",
+                    self.client_id, self.permission_level
+                );
+                return self.send_commands_packet().await;
             }
         }
 
         // Forward packet to client
         self.forward_to_client(packet).await
+    }
+
+    async fn send_commands_packet(&mut self) -> Result<()> {
+        let commands = build_commands_for_permission_level(self.permission_level);
+        let encoded =
+            EncodedPacket::from_bare(commands, None, ConnectionProtocol::Play).await?;
+        self.client_encoder.write_packet(&encoded).await?;
+        Ok(())
     }
 
     async fn forward_to_backend(&mut self, raw_packet: RawPacket) -> Result<()> {
